@@ -41,34 +41,100 @@ class OdeintAdjointMethod(torch.autograd.Function):
             adjoint_method = ctx.adjoint_method
             adjoint_options = ctx.adjoint_options
             t_requires_grad = ctx.t_requires_grad
+            shapes = ctx.shapes 
 
             # Backprop as if integrating up to event time.
             # Does NOT backpropagate through the event time.
             event_mode = ctx.event_mode
             if event_mode:
                 t, y, event_t, *adjoint_params = ctx.saved_tensors
-                _t = t
+                _t = t # Lưu lại tensor t gốc 
                 t = torch.cat([t[0].reshape(-1), event_t.reshape(-1)])
-                grad_y = grad_y[1]
+                grad_y = grad_y[1] # Lấy grad của y, bỏ qua grad của event_t 
             else:
                 t, y, *adjoint_params = ctx.saved_tensors
                 grad_y = grad_y[0]
 
             adjoint_params = tuple(adjoint_params)
+            y_final = y[-1]
+            # KIỂM TRA TÍNH THUẬN NGHỊCH 
+            is_reversible = hasattr(func, "inverse_dynamics") and callable(func.inverse_dynamics)
 
-            ##################################
-            #      Set up initial state      #
-            ##################################
-
+            if is_reversible:
+                warnings.warn("Using reversible adjoint (inverse_dynamics)")
+                try:
+                    y_reverse_trajectory = odeint(
+                    func.inverse_dynamics,
+                    y_final,
+                    t.flip(0), # thời gian chạy ngược từ t_N về t_0
+                    rtol=adjoint_rtol,
+                    atol=adjoint_atol,
+                    method=adjoint_method,
+                    options=adjoint_options,
+                )
+                except Exception as e:
+                    warnings.warn(f"Inverse dynamics integration failed: {e}")
+                    is_reversible = False
+                    y_reverse_trajectory = None
+            else:
+                warnings.warn("Using standard adjoint (no inverse_dynamics)")
+                y_reverse_trajectory = None
+            
+            # KHỞI TẠO TRẠNG THÁI BAN ĐẦU CHO HỆ ADJOINT
             # [-1] because y and grad_y are both of shape (len(t), *y0.shape)
-            aug_state = [torch.zeros((), dtype=y.dtype, device=y.device), y[-1], grad_y[-1]]  # vjp_t, y, vjp_y
-            aug_state.extend([torch.zeros_like(param) for param in adjoint_params])  # vjp_params
+            adj_y = grad_y[-1]  # dL/dy_N
+            adj_params_integrand = tuple(torch.zeros_like(p) for p in adjoint_params)
+            adj_t = torch.tensor(0., dtype=y.dtype, device=y.device)
 
+            # Trạng thái ban đầu của hệ adjoint tại t_N
+            adjoint_state = (adj_y,) + adj_params_integrand + (adj_t,)
             ##################################
             #    Set up backward ODE func    #
             ##################################
 
             # TODO: use a nn.Module and call odeint_adjoint to implement higher order derivatives.
+            def adjoint_dynamics(t_cur, adjoint_state_):
+                """
+                Tính đạo hàm của (a(t), integral(dL/dθ), dL/dt)
+                """
+                adj_y_ = adjoint_state_[0] # a(t)
+                adj_params_ = adjoint_state_[1:-1] # các tích phân tham số
+                adj_t_ = adjoint_state_[-1] # dL/dt
+
+                # Lấy trạng thái y(t) tương ứng
+                if is_reversible and y_reverse_trajectory is not None:
+                    # tìm index gần nhất trong t.flip(0)
+                    t_vals = t.flip(0)
+                    idx = torch.argmin(torch.abs(t_vals - t_cur))
+                    y_ = y_reverse_trajectory[idx]
+                else:
+                    # fallback: dùng xấp xỉ bằng y_final (kém chính xác hơn)
+                    y_ = y_final
+
+                # Tính f(t, y) và VJP
+                with torch.enable_grad():
+                    t_ = t_cur.detach().requires_grad_(True)
+                    y_ = y_.detach().requires_grad_(True)
+                    func_eval = func(t_, y_)
+
+                    vjp_t, vjp_y, *vjp_params = torch.autograd.grad(
+                        outputs=func_eval,
+                        inputs=(t_, y_) + adjoint_params,
+                        grad_outputs=-adj_y_,
+                        allow_unused=True,
+                        retain_graph=True
+                    )
+
+                # Xử lý None gradients
+                vjp_y = torch.zeros_like(y_) if vjp_y is None else vjp_y
+                vjp_t = torch.zeros_like(t_) if vjp_t is None else vjp_t
+                vjp_params = tuple(
+                    torch.zeros_like(p) if vjp_p is None else vjp_p
+                    for p, vjp_p in zip(adjoint_params, vjp_params)
+                )
+
+                return (vjp_y,) + vjp_params + (vjp_t,)
+            
             def augmented_dynamics(t, y_aug):
                 # Dynamics of the original system augmented with
                 # the adjoint wrt y, and an integrator wrt t and args.

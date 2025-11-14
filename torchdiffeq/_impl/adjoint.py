@@ -117,8 +117,8 @@ class OdeintAdjointMethod(torch.autograd.Function):
                         outputs=func_eval,
                         inputs=(t_, y_) + adjoint_params,
                         grad_outputs=-adj_y_,
-                        retain_graph=True
-                        allow_unused=True,
+                        retain_graph=True,
+                        allow_unused=True
                     )
 
                 # Xử lý None gradients

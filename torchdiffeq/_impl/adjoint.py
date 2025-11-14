@@ -57,72 +57,68 @@ class OdeintAdjointMethod(torch.autograd.Function):
 
             adjoint_params = tuple(adjoint_params)
             y_final = y[-1]
+
             # KIỂM TRA TÍNH THUẬN NGHỊCH 
             is_reversible = hasattr(func, "inverse_dynamics") and callable(func.inverse_dynamics)
 
-            if is_reversible:
-                warnings.warn("Using reversible adjoint (inverse_dynamics)")
-                try:
-                    y_reverse_trajectory = odeint(
-                    func.inverse_dynamics,
-                    y_final,
-                    t.flip(0), # thời gian chạy ngược từ t_N về t_0
-                    rtol=adjoint_rtol,
-                    atol=adjoint_atol,
-                    method=adjoint_method,
-                    options=adjoint_options,
-                )
-                except Exception as e:
-                    warnings.warn(f"Inverse dynamics integration failed: {e}")
-                    is_reversible = False
-                    y_reverse_trajectory = None
-            else:
-                warnings.warn("Using standard adjoint (no inverse_dynamics)")
-                y_reverse_trajectory = None
+            if not is_reversible:
+                warnings.warn("Using standard adjoint method for non-reversible func.")
+                
             
             # KHỞI TẠO TRẠNG THÁI BAN ĐẦU CHO HỆ ADJOINT
             # [-1] because y and grad_y are both of shape (len(t), *y0.shape)
             adj_y = grad_y[-1]  # dL/dy_N
             adj_params_integrand = tuple(torch.zeros_like(p) for p in adjoint_params)
-            adj_t = torch.tensor(0., dtype=y.dtype, device=y.device)
+            adj_t = torch.tensor(0., dtype=y_final.dtype, device=y_final.device)
 
             # Trạng thái ban đầu của hệ adjoint tại t_N
             adjoint_state = (adj_y,) + adj_params_integrand + (adj_t,)
+
+            # ---- TÍNH LẠI QUỸ ĐẠO y(t) NGƯỢC BẰNG inverse_dynamics ---- 
+            # Tích phân y ngược từ y(t_N) về y(t_0) - inverse_dynamics 
+            # Lưu lại các điểm y(t_i) trên quỹ đạo ngược này
+            y_reverse_trajectory = odeint(
+                func.inverse_dynamics,
+                y_final,
+                t.flip(0),
+                rtol = adjoint_rtol,
+                atol = adjoint_atol,
+                method = adjoint_method,
+                options = adjoint_options
+            )
+            # y_reverse_trajectory giờ chứa [y(t_N), y(t_{N-1}), ..., y(t_0)] chính xác
+
             ##################################
             #    Set up backward ODE func    #
             ##################################
 
             # TODO: use a nn.Module and call odeint_adjoint to implement higher order derivatives.
-            def adjoint_dynamics(t_cur, adjoint_state_):
+            def adjoint_dynamics(t, adjoint_state_):
                 """
                 Tính đạo hàm của (a(t), integral(dL/dθ), dL/dt)
                 """
                 adj_y_ = adjoint_state_[0] # a(t)
-                adj_params_ = adjoint_state_[1:-1] # các tích phân tham số
-                adj_t_ = adjoint_state_[-1] # dL/dt
 
-                # Lấy trạng thái y(t) tương ứng
-                if is_reversible and y_reverse_trajectory is not None:
-                    # tìm index gần nhất trong t.flip(0)
-                    t_vals = t.flip(0)
-                    idx = torch.argmin(torch.abs(t_vals - t_cur))
-                    y_ = y_reverse_trajectory[idx]
-                else:
-                    # fallback: dùng xấp xỉ bằng y_final (kém chính xác hơn)
-                    y_ = y_final
+                # Lấy trạng thái y(t) tương ứng từ quỹ đạo ngược đã tính
+                # Tìm index của t trong t.flip(0) để lấy đúng y
+                time_index = torch.where(t.flip(0) == t)[0][0]
+                y_ = y_reverse_trajectory[time_index] # lay chinh xac y(t)
 
                 # Tính f(t, y) và VJP
                 with torch.enable_grad():
-                    t_ = t_cur.detach().requires_grad_(True)
+                    t_ = t.detach().requires_grad_(True)
                     y_ = y_.detach().requires_grad_(True)
+
+                     # Tính f(t, y) cho VJP 
                     func_eval = func(t_, y_)
 
+                    # Tính VJP: -a^T df/dy, -a^T df/dtheta, -a^T df/dt
                     vjp_t, vjp_y, *vjp_params = torch.autograd.grad(
                         outputs=func_eval,
                         inputs=(t_, y_) + adjoint_params,
                         grad_outputs=-adj_y_,
-                        allow_unused=True,
                         retain_graph=True
+                        allow_unused=True,
                     )
 
                 # Xử lý None gradients
@@ -133,91 +129,38 @@ class OdeintAdjointMethod(torch.autograd.Function):
                     for p, vjp_p in zip(adjoint_params, vjp_params)
                 )
 
-                return (vjp_y,) + vjp_params + (vjp_t,)
+                return (vjp_y,) + vjp_params + (vjp_t,)  # (da/dt, d(integral)/dt, d(dL/dt)/dt) 
             
-            def augmented_dynamics(t, y_aug):
-                # Dynamics of the original system augmented with
-                # the adjoint wrt y, and an integrator wrt t and args.
-                y = y_aug[1]
-                adj_y = y_aug[2]
-                # ignore gradients wrt time and parameters
+            # Giải ODE Adjoint
+            if t_requires_grad:
+                time_vjps = torch.empty(len(t), dtype = t.dtype, device = t.device)
+            
+            # Tích phân hệ adjoint ngược thời gian từ t_N về t_0
+            adjoint_outputs = odeint(
+                adjoint_dynamics,
+                adjoint_state,
+                t.flip(0),
+                rtol = adjoint_rtol,
+                atol = adjoint_atol,
+                method = adjoint_method,
+                options = adjoint_options
+            )
 
-                with torch.enable_grad():
-                    t_ = t.detach()
-                    t = t_.requires_grad_(True)
-                    y = y.detach().requires_grad_(True)
+            # Lấy kết quả cuối cùng tại t_0
+            adj_y_t0 = adjoint_outputs[0][-1]
+            adj_params_t0 = tuple(out[-1] for out in adjoint_outputs[1:-1])
+            adj_t_t0 = adjoint_outputs[-1][-1]
 
-                    # If using an adaptive solver we don't want to waste time resolving dL/dt unless we need it (which
-                    # doesn't necessarily even exist if there is piecewise structure in time), so turning off gradients
-                    # wrt t here means we won't compute that if we don't need it.
-                    func_eval = func(t if t_requires_grad else t_, y)
-
-                    # Workaround for PyTorch bug #39784
-                    _t = torch.as_strided(t, (), ())  # noqa
-                    _y = torch.as_strided(y, (), ())  # noqa
-                    _params = tuple(torch.as_strided(param, (), ()) for param in adjoint_params)  # noqa
-
-                    vjp_t, vjp_y, *vjp_params = torch.autograd.grad(
-                        func_eval, (t, y) + adjoint_params, -adj_y,
-                        allow_unused=True, retain_graph=True
-                    )
-
-                # autograd.grad returns None if no gradient, set to zero.
-                vjp_t = torch.zeros_like(t) if vjp_t is None else vjp_t
-                vjp_y = torch.zeros_like(y) if vjp_y is None else vjp_y
-                vjp_params = [torch.zeros_like(param) if vjp_param is None else vjp_param
-                              for param, vjp_param in zip(adjoint_params, vjp_params)]
-
-                return (vjp_t, func_eval, vjp_y, *vjp_params)
-
-            # Add adjoint callbacks
-            for callback_name, adjoint_callback_name in zip(_all_callback_names, _all_adjoint_callback_names):
-                try:
-                    callback = getattr(func, adjoint_callback_name)
-                except AttributeError:
-                    pass
-                else:
-                    setattr(augmented_dynamics, callback_name, callback)
-
-            ##################################
-            #       Solve adjoint ODE        #
-            ##################################
+            # Cộng gradient từ các điểm trung gian
+            adj_y_t0 = adj_y_t0 + grad_y[0]
 
             if t_requires_grad:
-                time_vjps = torch.empty(len(t), dtype=t.dtype, device=t.device)
-            else:
-                time_vjps = None
-            for i in range(len(t) - 1, 0, -1):
-                if t_requires_grad:
-                    # Compute the effect of moving the current time measurement point.
-                    # We don't compute this unless we need to, to save some computation.
-                    func_eval = func(t[i], y[i])
-                    dLd_cur_t = func_eval.reshape(-1).dot(grad_y[i].reshape(-1))
-                    aug_state[0] -= dLd_cur_t
-                    time_vjps[i] = dLd_cur_t
-
-                # Run the augmented system backwards in time.
-                aug_state = odeint(
-                    augmented_dynamics, tuple(aug_state),
-                    t[i - 1:i + 1].flip(0),
-                    rtol=adjoint_rtol, atol=adjoint_atol, method=adjoint_method, options=adjoint_options
-                )
-                aug_state = [a[1] for a in aug_state]  # extract just the t[i - 1] value
-                aug_state[1] = y[i - 1]  # update to use our forward-pass estimate of the state
-                aug_state[2] += grad_y[i - 1]  # update any gradients wrt state at this time point
-
-            if t_requires_grad:
-                time_vjps[0] = aug_state[0]
-
-            # Only compute gradient wrt initial time when in event handling mode.
-            if event_mode and t_requires_grad:
-                time_vjps = torch.cat([time_vjps[0].reshape(-1), torch.zeros_like(_t[1:])])
-
-            adj_y = aug_state[2]
-            adj_params = aug_state[3:]
-
-        return (None, None, adj_y, time_vjps, None, None, None, None, None, None, None, None, None, None, *adj_params)
-
+                time_vjps = adjoint_outputs[-1].flip(0)
+            
+            # Trả về gradients 
+            # shapes, func, y0, t, rtol, atol, method, options, event_fn, adjoint_rtol, adjoint_atol, 
+            # adjoint_method, adjoint_options, t.requires_grad, *adjoint_params 
+            return (None, None, adj_y_t0, time_vjps, None, None, None, None, None, None, None, None, None, None, *adj_params_t0)
 
 def odeint_adjoint(func, y0, t, *, rtol=1e-7, atol=1e-9, method=None, options=None, event_fn=None,
                    adjoint_rtol=None, adjoint_atol=None, adjoint_method=None, adjoint_options=None, adjoint_params=None):

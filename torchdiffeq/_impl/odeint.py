@@ -1,10 +1,12 @@
 import torch
 from torch.autograd.functional import vjp
+#dopri5, rk4, tsit5, bosh3, fehlberg2 … là các phương pháp Runge–Kutta.
 from .dopri5 import Dopri5Solver
 from .bosh3 import Bosh3Solver
 from .adaptive_heun import AdaptiveHeunSolver
 from .fehlberg2 import Fehlberg2
 from .fixed_grid import Euler, Midpoint, Heun2, Heun3, RK4
+# fixed_grid_* và implicit_* là các phương pháp cố định bước.
 from .fixed_grid_implicit import ImplicitEuler, ImplicitMidpoint, Trapezoid
 from .fixed_grid_implicit import GaussLegendre4, GaussLegendre6
 from .fixed_grid_implicit import RadauIIA3, RadauIIA5
@@ -13,9 +15,10 @@ from .fixed_adams import AdamsBashforth, AdamsBashforthMoulton
 from .dopri8 import Dopri8Solver
 from .tsit5 import Tsit5Solver
 from .scipy_wrapper import ScipyWrapperODESolver
-from .misc import _check_inputs, _flat_to_shape
-from .interp import _interp_evaluate
+from .misc import _check_inputs, _flat_to_shape # kiểm tra tính hợp lệ của đầu vào (ví dụ: chiều, kiểu dữ liệu, hướng thời gian).
+from .interp import _interp_evaluate # đưa nghiệm về lại đúng shape ban đầu (vì trong quá trình solver có thể flatten).
 
+# create list of solvers
 SOLVERS = {
     'dopri8': Dopri8Solver,
     'dopri5': Dopri5Solver,
@@ -58,30 +61,29 @@ def odeint(func, y0, t, *, rtol=1e-7, atol=1e-9, method=None, options=None, even
     Output dtypes and numerical precision are based on the dtypes of the inputs `y0`.
 
     Args:
-        func: Function that maps a scalar Tensor `t` and a Tensor holding the state `y`
-            into a Tensor of state derivatives with respect to time. Optionally, `y`
-            can also be a tuple of Tensors.
-        y0: N-D Tensor giving starting value of `y` at time point `t[0]`. Optionally, `y0`
-            can also be a tuple of Tensors.
-        t: 1-D Tensor holding a sequence of time points for which to solve for
-            `y`, in either increasing or decreasing order. The first element of
-            this sequence is taken to be the initial time point.
-        rtol: optional float64 Tensor specifying an upper bound on relative error,
-            per element of `y`.
-        atol: optional float64 Tensor specifying an upper bound on absolute error,
-            per element of `y`.
+        func: Hàm ánh xạ từ một Tensor vô hướng t (thời gian) và một Tensor y (trạng thái)
+            → sang một Tensor đạo hàm dy/dt theo thời gian.
+            (Ngoài ra, y cũng có thể là một tuple của nhiều Tensor.)
+        y0: Tensor N-chiều (N-D) biểu diễn giá trị ban đầu của y tại thời điểm t[0].
+            (Cũng có thể là một tuple các Tensor.)
+        t: Tensor 1-chiều chứa chuỗi các thời điểm mà ta muốn tính nghiệm y.
+            Các giá trị có thể tăng dần hoặc giảm dần.
+            Phần tử đầu tiên của t được xem là thời điểm ban đầu t[0].
+        rtol: Tensor float64 xác định giới hạn sai số tương đối tối đa cho mỗi phần tử của y.
+            (tuy` chon)
+        atol: Tensor float64 xác định giới hạn sai số tuyệt đối tối đa cho mỗi phần tử của y.
+            (tuy` chon)
         method: optional string indicating the integration method to use.
-        options: optional dict of configuring options for the indicated integration
-            method. Can only be provided if a `method` is explicitly set.
-        event_fn: Function that maps the state `y` to a Tensor. The solve terminates when
-            event_fn evaluates to zero. If this is not None, all but the first elements of
-            `t` are ignored.
+        options: Từ điển (dict) cấu hình thêm cho phương pháp tích phân đã chọn.
+            Chỉ có thể dùng nếu bạn đã chỉ rõ method.
+        event_fn: Hàm ánh xạ trạng thái y sang một Tensor.
+            Quá trình giải sẽ dừng lại khi giá trị này bằng 0.
+            Nếu tham số này khác None, thì tất cả các phần tử của t trừ phần tử đầu tiên sẽ bị bỏ qua.
 
     Returns:
-        y: Tensor, where the first dimension corresponds to different
-            time points. Contains the solved value of y for each desired time point in
-            `t`, with the initial value `y0` being the first element along the first
-            dimension.
+        y: Một Tensor (hoặc tuple các Tensor), trong đó chiều đầu tiên tương ứng với các thời điểm trong t.
+            Mỗi phần tử dọc theo chiều đầu tiên là nghiệm của y tại thời điểm tương ứng.
+            Giá trị ban đầu y0 sẽ là phần tử đầu tiên (y[0]).
 
     Raises:
         ValueError: if an invalid `method` is provided.
@@ -89,18 +91,20 @@ def odeint(func, y0, t, *, rtol=1e-7, atol=1e-9, method=None, options=None, even
 
     shapes, func, y0, t, rtol, atol, method, options, event_fn, t_is_reversed = _check_inputs(func, y0, t, rtol, atol, method, options, event_fn, SOLVERS)
 
-    solver = SOLVERS[method](func=func, y0=y0, rtol=rtol, atol=atol, **options)
+    solver = SOLVERS[method](func=func, y0=y0, rtol=rtol, atol=atol, **options) # Select Solvers
 
     if event_fn is None:
-        solution = solver.integrate(t)
+        solution = solver.integrate(t) #ko co solver -> giải ODE
     else:
-        event_t, solution = solver.integrate_until_event(t[0], event_fn)
+        event_t, solution = solver.integrate_until_event(t[0], event_fn) # dừng khi event_fn(y)=0
         event_t = event_t.to(t)
         if t_is_reversed:
             event_t = -event_t
+            #dùng để đồng bộ hướng thời gian của thời điểm sự kiện (event_t) với hướng tích phân (t)
+            # đảm bảo rằng kết quả đúng dù bạn đang chạy xuôi hay ngược thời gian.
 
     if shapes is not None:
-        solution = _flat_to_shape(solution, (len(t),), shapes)
+        solution = _flat_to_shape(solution, (len(t),), shapes) # Khôi phục shape ban đầu -> giữ đúng cấu trúc dữ liệu của bài toán gốc
 
     if event_fn is None:
         return solution
@@ -116,7 +120,7 @@ def odeint_dense(func, y0, t0, t1, *, rtol=1e-7, atol=1e-9, method=None, options
 
     shapes, func, y0, t, rtol, atol, method, options, _, _ = _check_inputs(func, y0, t, rtol, atol, method, options, None, SOLVERS)
 
-    assert method == "dopri5"
+    assert method == "dopri5" # phương pháp Dormand–Prince (bắt buộc)
 
     solver = Dopri5Solver(func=func, y0=y0, rtol=rtol, atol=atol, **options)    
     

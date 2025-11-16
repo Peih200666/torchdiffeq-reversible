@@ -7,27 +7,27 @@ from .event_handling import combine_event_functions
 
 
 _all_callback_names = ['callback_step', 'callback_accept_step', 'callback_reject_step']
-_all_adjoint_callback_names = [name + '_adjoint' for name in _all_callback_names]
+_all_adjoint_callback_names = [name + '_adjoint' for name in _all_callback_names] # phiên bản “adjoint” (cho chế độ tính gradient ngược).
 _null_callback = lambda *args, **kwargs: None
 
-def _handle_unused_kwargs(solver, unused_kwargs):
+def _handle_unused_kwargs(solver, unused_kwargs): # phát cảnh báo khi truyền vào solver tham số không hợp lệ.
     if len(unused_kwargs) > 0:
         warnings.warn('{}: Unexpected arguments {}'.format(solver.__class__.__name__, unused_kwargs))
 
 
-def _linf_norm(tensor):
+def _linf_norm(tensor): # chuẩn vô cực (L∞ norm)
     return tensor.abs().max()
 
 
-def _rms_norm(tensor):
+def _rms_norm(tensor): # chuẩn căn trung bình bình phương (RMS — Root Mean Square)
     return tensor.abs().pow(2).mean().sqrt()
 
 
-def _zero_norm(tensor):
+def _zero_norm(tensor): # chuẩn “rỗng” (trả về 0 bất kể đầu vào)
     return 0.
 
 
-def _mixed_norm(tensor_tuple):
+def _mixed_norm(tensor_tuple): # đảm bảo solver không bỏ qua biến nào có sai số lớn.
     if len(tensor_tuple) == 0:
         return 0.
     return max([_rms_norm(tensor) for tensor in tensor_tuple])
@@ -43,30 +43,32 @@ def _select_initial_step(func, t0, y0, order, rtol, atol, norm, f0=None):
     .. [1] E. Hairer, S. P. Norsett G. Wanner, "Solving Ordinary Differential
            Equations I: Nonstiff Problems", Sec. II.4, 2nd edition.
     """
-
+    # order: Bậc của phương pháp (VD: RK4 có order = 4)
     dtype = y0.dtype
-    device = y0.device
+    device = y0.device # device cho biết tensor nằm ở đâu
     t_dtype = t0.dtype
     t0 = t0.to(t_dtype)
 
     if f0 is None:
         f0 = func(t0, y0)
 
-    scale = atol + torch.abs(y0) * rtol
+    scale = atol + torch.abs(y0) * rtol # Công thức chuẩn hóa sai số -> cân bằng giữa sai số tuyệt đối & tương đối.
 
-    d0 = norm(y0 / scale).abs()
-    d1 = norm(f0 / scale).abs()
+    d0 = norm(y0 / scale).abs() # Độ lớn tương đối của trạng thái ban đầu
+    d1 = norm(f0 / scale).abs() # Độ lớn tương đối của đạo hàm ban đầu
 
+    # h0: Bước thời gian đầu tiên -> Solver khởi động an toàn, không bị sai số quá lớn hoặc quá nhỏ
     if d0 < 1e-5 or d1 < 1e-5:
         h0 = torch.tensor(1e-6, dtype=dtype, device=device)
     else:
         h0 = 0.01 * d0 / d1
     h0 = h0.abs()
-
+    
+    # thử bước đầu tiên
     y1 = y0 + h0 * f0
     f1 = func(t0 + h0, y1)
 
-    d2 = torch.abs(norm((f1 - f0) / scale) / h0)
+    d2 = torch.abs(norm((f1 - f0) / scale) / h0) # đo độ cong của hàm đạo hàm (mức thay đổi của f)
 
     if d1 <= 1e-15 and d2 <= 1e-15:
         h1 = torch.max(torch.tensor(1e-6, dtype=dtype, device=device), h0 * 1e-3)
@@ -77,7 +79,7 @@ def _select_initial_step(func, t0, y0, order, rtol, atol, norm, f0=None):
     return torch.min(100 * h0, h1).to(t_dtype)
 
 
-def _compute_error_ratio(error_estimate, rtol, atol, y0, y1, norm):
+def _compute_error_ratio(error_estimate, rtol, atol, y0, y1, norm): # đo xem bước vừa rồi chính xác đến mức nào
     error_tol = atol + rtol * torch.max(y0.abs(), y1.abs())
     return norm(error_estimate / error_tol).abs()
 
@@ -85,12 +87,15 @@ def _compute_error_ratio(error_estimate, rtol, atol, y0, y1, norm):
 @torch.no_grad()
 def _optimal_step_size(last_step, error_ratio, safety, ifactor, dfactor, order):
     """Calculate the optimal size for the next step."""
+    # safety: Hệ số an toàn (thường 0.9 hoặc 0.95) để không tăng quá mạnh
+    # ifactor: giới hạn tăng bước tối đa (thường ≈ 5)
+    # dfactor: giới hạn giảm bước tối thiểu (thường ≈ 0.2)
     if error_ratio == 0:
         return last_step * ifactor
     if error_ratio < 1:
         dfactor = torch.ones((), dtype=last_step.dtype, device=last_step.device)
     error_ratio = error_ratio.type_as(last_step)
-    exponent = torch.tensor(order, dtype=last_step.dtype, device=last_step.device).reciprocal()
+    exponent = torch.tensor(order, dtype=last_step.dtype, device=last_step.device).reciprocal() # reciprocal(): nghich dao. x -> 1 / x
     factor = torch.min(ifactor, torch.max(safety / error_ratio ** exponent, dfactor))
     return last_step * factor
 
@@ -177,6 +182,12 @@ class _PerturbFunc(torch.nn.Module):
         super(_PerturbFunc, self).__init__()
         self.base_func = base_func
 
+        if hasattr(base_func, "inverse_dynamics") and callable(base_func.inverse_dynamics):
+            # gán method cho instance _PerturbFunc
+            def _inverse_dynamics(t, y):
+                return base_func.inverse_dynamics(t, y)
+            self.inverse_dynamics = _inverse_dynamics
+            
     def forward(self, t, y, *, perturb=Perturb.NONE):
         assert isinstance(perturb, Perturb), "perturb argument must be of type Perturb enum"
         # This dtype change here might be buggy.

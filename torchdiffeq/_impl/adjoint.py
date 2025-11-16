@@ -42,6 +42,11 @@ class OdeintAdjointMethod(torch.autograd.Function):
             adjoint_options = ctx.adjoint_options
             t_requires_grad = ctx.t_requires_grad
             shapes = ctx.shapes 
+
+            adjoint_options_rev = {}
+            if adjoint_options is not None:
+                adjoint_options_rev = {k: v for k, v in adjoint_options.items() if k != "norm"}
+
             # Backprop as if integrating up to event time.
             # Does NOT backpropagate through the event time.
             event_mode = ctx.event_mode
@@ -176,35 +181,27 @@ class OdeintAdjointMethod(torch.autograd.Function):
                 rtol = adjoint_rtol,
                 atol = adjoint_atol,
                 method = adjoint_method,
-                options = adjoint_options
+                options = adjoint_options_rev,
             )
             # y_reverse_trajectory giờ chứa [y(t_N), y(t_{N-1}), ..., y(t_0)] chính xác
 
-            # Tính f(t_i, y_i) = dy/dt tại từng mốc – dùng no_grad vì chỉ để nội suy
-            f_rev_list = []
-            for i in range(len(t_rev)):
-                f_rev_list.append(func(t_rev[i], y_reverse_trajectory[i]))
-            f_rev = torch.stack(f_rev_list, dim = 0) 
+            # Chuẩn bị trajectory forward
+            t_fw = t # tăng dần: [t_0, ..., t_N]
+            y_fw = y_reverse_trajectory.flip(0)
+            f_fw = torch.stack([func(t_fw[i], y_fw[i]) for i in range(len(t_fw))], dim=0)
 
             # Hàm nội suy Hermite
-            def hermite_interpolate(t_rev, y_rev, f_rev, t_local):
-                """
-                Nội suy cubic Hermite để lấy y(t_local)
-                t_rev: 1D tensor thời gian (đang giảm dần: [t_N, ..., t_0])
-                y_rev: [N, *state]
-                f_rev: [N, *state] = dy/dt tại từng t_rev
-                t_local: scalar tensor (thời gian hiện tại của adjoint_dynamics)
-                """
-                # searchsorted cần dãy tăng dần → dùng -t_rev
-                idx = torch.searchsorted(-t_rev, -t_local) - 1 # interval index
-                idx = torch.clamp(idx, 0, t_rev.shape[0] - 2) # bảo vệ tính an toàn của nội suy.
+            def hermite_interpolate(t_local):
+                # tìm khoảng [t_i, t_{i+1}] sao cho t_i <= t <= t_{i+1}
+                idx = torch.searchsorted(t_fw, t_local) - 1 # interval index
+                idx = torch.clamp(idx, 0, len(t_fw) - 2) # bảo vệ tính an toàn của nội suy.
 
-                t0 = t_rev[idx]
-                t1 = t_rev[idx + 1]
-                y0 = y_rev[idx]
-                y1 = y_rev[idx + 1]
-                f0 = f_rev[idx]
-                f1 = f_rev[idx + 1]
+                t0 = t_fw[idx]
+                t1 = t_fw[idx + 1]
+                y0 = y_fw[idx]
+                y1 = y_fw[idx + 1]
+                f0 = f_fw[idx]
+                f1 = f_fw[idx + 1]
 
                 h = t1 - t0
                 # tránh chia cho 0 trong trường hợp hiếm khi t trùng
@@ -219,7 +216,7 @@ class OdeintAdjointMethod(torch.autograd.Function):
                 h01 = -2 * (tau ** 3) + 3 * (tau ** 2)
                 h11 = (tau ** 3) - (tau ** 2)
 
-                return h00 * y0 + h01 * y1 + h10 * h * f0 + h11 * h * f1
+                return h00 * y0 + h01 * y1 + h * (h10 * f0 + h11 * f1)
               
             def adjoint_dynamics(t, adjoint_state_):
                 """
@@ -235,28 +232,40 @@ class OdeintAdjointMethod(torch.autograd.Function):
                 # y_ = y_reverse_trajectory[time_index] # lay chinh xac y(t)
 
                 # New - use cubic Hermite
-                y_ = hermite_interpolate(t_rev, y_reverse_trajectory, f_rev, t)
+                y_ = hermite_interpolate(t)
 
                 # Tính f(t, y) và VJP
                 with torch.enable_grad():
-                    if t_requires_grad:
-                        t_ = t.detach().requires_grad_(True)
-                    else:
-                        t_ = t.detach()
-                    
                     y_ = y_.detach().requires_grad_(True)
 
-                     # Tính f(t, y) cho VJP 
-                    func_eval = func(t_, y_)
+                    if t_requires_grad: # Trường hợp cần grad theo t
+                        t_ = t.detach().requires_grad_(True)
+                        func_eval = func(t_, y_)
 
-                    # Tính VJP: -a^T df/dy, -a^T df/dtheta, -a^T df/dt
-                    vjp_t, vjp_y, *vjp_params = torch.autograd.grad(
-                        outputs=func_eval,
-                        inputs=(t_, y_) + adjoint_params,
-                        grad_outputs=-adj_y_,
-                        retain_graph=True,
-                        allow_unused=True
-                    )
+                        # Tính VJP: -a^T df/dy, -a^T df/dtheta, -a^T df/dt
+                        vjp_t, vjp_y, *vjp_params = torch.autograd.grad(
+                            outputs=func_eval,
+                            inputs=(t_, y_) + adjoint_params,
+                            grad_outputs=-adj_y_,
+                            retain_graph=True,
+                            allow_unused=True,
+                        )
+                    else: # Không cần grad theo t: không đưa t vào inputs
+                        t_ = t.detach()
+                        func_eval = func(t_, y_)
+
+                        # Tính VJP: -a^T df/dy, -a^T df/dtheta, -a^T df/dt
+                        grads = torch.autograd.grad(
+                            outputs=func_eval,
+                            inputs=(y_, ) + adjoint_params,
+                            grad_outputs=-adj_y_,
+                            retain_graph=True,
+                            allow_unused=True
+                        )
+
+                        vjp_y = grads[0]
+                        vjp_params = grads[1:]
+                        vjp_t = torch.zeros_like(t_)
 
                 # Xử lý None gradients
                 vjp_y = torch.zeros_like(y_) if vjp_y is None else vjp_y
@@ -266,7 +275,7 @@ class OdeintAdjointMethod(torch.autograd.Function):
                     for p, vjp_p in zip(adjoint_params, vjp_params)
                 )
 
-                return (vjp_y,) + vjp_params + (vjp_t,)  # (da/dt, d(integral)/dt, d(dL/dt)/dt) 
+                return  (vjp_y,) + vjp_params + (vjp_t,)  # (da/dt, d(integral)/dt, d(dL/dt)/dt) 
                
             # Giải ODE Adjoint
             if t_requires_grad:
@@ -286,9 +295,11 @@ class OdeintAdjointMethod(torch.autograd.Function):
                     func_eval_i = func(t[i], y_i)
                     dLd_t_i = func_eval_i.reshape(-1).dot(grad_y[i].reshape(-1))
 
-                    # adj_t -= dL/dt_i
-                    adj_t_cur = adjoint_state[-1] - dLd_t_i
-                    adjoint_state = (adjoint_state[0], *adjoint_state[1:-1], adj_t_cur)
+                    # cập nhật adj_t an toàn
+                    adjoint_state = list(adjoint_state)
+                    adjoint_state[-1] = adjoint_state[-1] - dLd_t_i
+                    adjoint_state = tuple(adjoint_state)
+
                     time_vjps[i] = dLd_t_i
 
                 # 2) Tích phân adjoint từ t[i] về t[i-1]
@@ -300,7 +311,7 @@ class OdeintAdjointMethod(torch.autograd.Function):
                     rtol=adjoint_rtol,
                     atol=adjoint_atol,
                     method=adjoint_method,
-                    options=adjoint_options,
+                    options=adjoint_options_rev,
                 )
 
                 # Lấy trạng thái tại t_{i-1} (index 1)
@@ -375,7 +386,7 @@ def odeint_adjoint(func, y0, t, *, rtol=1e-7, atol=1e-9, method=None, options=No
     shapes, func, y0, t, rtol, atol, method, options, event_fn, decreasing_time = _check_inputs(func, y0, t, rtol, atol, method, options, event_fn, SOLVERS)
 
     # Handle the adjoint norm function.
-    state_norm = options["norm"]
+    state_norm = options.get("norm", None)
     handle_adjoint_norm_(adjoint_options, shapes, state_norm)
 
     ans = OdeintAdjointMethod.apply(shapes, func, y0, t, rtol, atol, method, options, event_fn, adjoint_rtol, adjoint_atol,

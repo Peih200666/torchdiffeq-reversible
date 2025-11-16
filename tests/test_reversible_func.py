@@ -10,10 +10,10 @@ func = ReversibleODEFunc(state_dim=state_dim)
 
 # 2) Trạng thái ban đầu và thời gian
 y0 = torch.randn(1, state_dim)  # batch = 1
-t = torch.linspace(0., 1., 2001)  # 21 điểm từ 0 -> 1
+t = torch.linspace(0., 1., 21)  # 21 điểm từ 0 -> 1
 
 # 3) Tích phân thuận
-y_traj = odeint(func, y0, t, rtol=1e-8, atol=1e-8)
+y_traj = odeint(func, y0, t, rtol=1e-7, atol=1e-7)
 y_end = y_traj[-1]
 
 # 4) Tích phân ngược bằng inverse_dynamics để khôi phục y0
